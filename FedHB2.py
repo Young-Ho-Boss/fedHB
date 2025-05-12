@@ -30,7 +30,7 @@ use_knowledge_distillation = True  # 지식 증류 사용
 use_quantization = True  # 양자화 사용
 use_server_momentum = True  # 서버 모멘텀 사용
 use_active_client_selection = True  # 활성 클라이언트 선택 사용
-use_async_parallel = True  # 비동기 병렬 처리 사용
+use_async_parallel = False  # 비동기 병렬 처리 비활성화
 
 # 양자화 설정
 quantization_bits_conv = 8  # 컨볼루션 레이어 양자화 비트
@@ -295,28 +295,8 @@ def client_update(client_model, data_loader, optimizer, criterion, global_model,
     avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
     return client_model, avg_loss, total_samples
 
-# 6. 비동기 병렬 클라이언트 학습
-def async_client_train(client_id, global_model_state, data_loader, criterion, round_idx, total_rounds, pruning_threshold, kd_alpha):
-    """비동기 병렬 클라이언트 학습 함수"""
-    # 클라이언트 모델 초기화
-    client_model = SimpleCNN().to(device)
-    client_model.load_state_dict(global_model_state)
-
-    # 옵티마이저 설정
-    optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
-
-    # 글로벌 모델 참조용 (지식 증류)
-    global_model = SimpleCNN().to(device)
-    global_model.load_state_dict(global_model_state)
-    global_model.eval()
-
-    # 클라이언트 업데이트
-    updated_model, loss, samples = client_update(
-        client_model, data_loader, optimizer, criterion, global_model,
-        round_idx, total_rounds, pruning_threshold, kd_alpha
-    )
-
-    return client_id, updated_model.state_dict(), loss, samples
+# 6. 비동기 병렬 클라이언트 학습 함수 제거
+# async_client_train 함수 삭제
 
 # 7. 서버 업데이트 함수
 def server_aggregate(global_model, client_states, client_losses, client_samples, server_velocity=None, momentum_beta=0.9):
@@ -377,7 +357,7 @@ def evaluate_model(model, testloader):
 
 # 9. 통합 연합 학습 함수
 def federated_learning():
-    """향상된 비동기 연합 학습 프레임워크 실행 함수"""
+    """향상된 연합 학습 프레임워크 실행 함수"""
     # 데이터셋 준비
     client_loaders, testloader, client_data_stats = prepare_dataset()
     clusters = client_data_stats["clusters"]
@@ -454,52 +434,27 @@ def federated_learning():
         client_losses = []
         client_sample_sizes = []
 
-        # 비동기 병렬 클라이언트 학습
-        if use_async_parallel:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = []
-                for cid in participating_clients:
-                    # 비동기 클라이언트 훈련 작업 제출
-                    futures.append(executor.submit(
-                        async_client_train,
-                        cid,
-                        global_model.state_dict(),
-                        client_loaders[cid],
-                        criterion,
-                        r,
-                        num_rounds,
-                        current_pruning_thr,
-                        kd_alpha
-                    ))
+        # 순차적 클라이언트 학습
+        for cid in participating_clients:
+            client_model = SimpleCNN().to(device)
+            client_model.load_state_dict(global_model.state_dict())
+            optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
 
-                # 결과 수집
-                for future in concurrent.futures.as_completed(futures):
-                    client_id, updated_state, loss, samples = future.result()
-                    client_states.append(updated_state)
-                    client_losses.append(loss)
-                    client_sample_sizes.append(samples)
-        else:
-            # 순차적 클라이언트 훈련
-            for cid in participating_clients:
-                client_model = SimpleCNN().to(device)
-                client_model.load_state_dict(global_model.state_dict())
-                optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
+            updated_model, loss, samples = client_update(
+                client_model,
+                client_loaders[cid],
+                optimizer,
+                criterion,
+                global_model,
+                r,
+                num_rounds,
+                current_pruning_thr,
+                kd_alpha
+            )
 
-                updated_model, loss, samples = client_update(
-                    client_model,
-                    client_loaders[cid],
-                    optimizer,
-                    criterion,
-                    global_model,
-                    r,
-                    num_rounds,
-                    current_pruning_thr,
-                    kd_alpha
-                )
-
-                client_states.append(updated_model.state_dict())
-                client_losses.append(loss)
-                client_sample_sizes.append(samples)
+            client_states.append(updated_model.state_dict())
+            client_losses.append(loss)
+            client_sample_sizes.append(samples)
 
         # 업로드 단계: 클라이언트 → 서버 (로컬 모델 전송)
         upload_size = model_size_bytes * len(participating_clients)
