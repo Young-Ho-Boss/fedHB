@@ -36,9 +36,16 @@ use_async_parallel = False  # 비동기 병렬 처리 비활성화
 quantization_bits_conv = 8  # 컨볼루션 레이어 양자화 비트
 quantization_bits_fc = 16   # 완전연결 레이어 양자화 비트
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+# GPU 설정
+if not torch.cuda.is_available():
+    raise RuntimeError("GPU가 필요합니다. CUDA가 설치되어 있는지 확인해주세요.")
+device = torch.device('cuda')
+torch.cuda.empty_cache()  # GPU 메모리 초기화
+print(f"GPU 사용: {torch.cuda.get_device_name(0)}")
+print(f"사용 가능한 GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+
 torch.manual_seed(0)
+torch.cuda.manual_seed(0)  # GPU 시드 설정
 
 # 2. 모델 정의
 class SimpleCNN(nn.Module):
