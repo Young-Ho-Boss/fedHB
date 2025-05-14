@@ -41,10 +41,10 @@ momentum_beta = 0.9  # 서버 모멘텀 계수
 kd_alpha = 0.5  # 지식 증류 가중치 계수
 
 # 개선 옵션 설정
-use_adaptive_pruning = True  # 적응적 가지치기 사용
+use_adaptive_pruning = False  # 적응적 가지치기 사용
 use_importance_sampling = True  # 중요도 샘플링 사용
 use_knowledge_distillation = True  # 지식 증류 사용
-use_quantization = True  # 양자화 사용
+use_quantization = False  # 양자화 사용
 use_server_momentum = True  # 서버 모멘텀 사용
 use_active_client_selection = True  # 활성 클라이언트 선택 사용
 use_async_parallel = False  # 비동기 병렬 처리 비활성화
@@ -70,22 +70,24 @@ torch.cuda.manual_seed(0)  # GPU 시드 설정
 class EnhancedClassifier(nn.Module):
     def __init__(self, in_features=4096, out_features=10, rank=32):
         super().__init__()
-        # 저랭크 파라미터화 (Low-rank Factorization)
-        self.A = nn.Parameter(torch.randn(in_features, rank))
-        self.B = nn.Parameter(torch.randn(rank, out_features))
-        
+        self.A = nn.Parameter(torch.empty(in_features, rank))
+        self.B = nn.Parameter(torch.empty(rank, out_features))
+        nn.init.xavier_uniform_(self.A)
+        nn.init.xavier_uniform_(self.B)
     def forward(self, x):
-        return x @ (self.A @ self.B)  # W = A*B (Low-rank)
-    
+        return x @ (self.A @ self.B)
+
 # 2. 모델 정의
 class SimpleCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2)
         )
@@ -107,62 +109,64 @@ class SimpleCNN(nn.Module):
         return probs
 
 # 수정 2: 구조화된 업데이트 적용 (Algorithm 1)
-def structured_update(params):
-    for name, param in params.items():
-        if 'classifier' in name:  # Enhancer 계층만 처리
-            # Random Masking (검색 결과[2]의 전략)
-            mask = torch.rand_like(param) > 0.8  # 20% 유지
-            param.data *= mask.float()
-            # 양자화 (검색 결과[5] QSGD 기반)
-            param.data = quantize(param.data, bits=4)
+# def structured_update(params):
+#     pass
 
 # 수정 3: 클라이언트 학습 시 Enhancer만 업데이트
 def client_update(client_model, data_loader, optimizer, criterion, global_model, round_idx, total_rounds, pruning_threshold, kd_alpha):
-    """클라이언트 로컬 학습 함수"""
+    # 데이터가 없으면 학습 건너뜀
+    if len(data_loader.dataset) == 0:
+        print("클라이언트 데이터 없음, 학습 건너뜀")
+        return client_model, float('inf'), 0
     try:
         client_model.train()
         total_loss = 0.0
         total_samples = 0
-
-        # FedProx 파라미터
-        mu = 0.01  # 프록시멀 항 계수
-
+        mu = 0.01  # FedProx 파라미터
+        # optimizer를 학습률 0.001로 재설정
+        optimizer = optim.SGD(client_model.parameters(), lr=0.001, momentum=0.9)
         for epoch in range(local_epochs):
             for x, y in data_loader:
+                # ======= 진단 코드 시작 (파일로 저장) =======
+                with open('param_stats.txt', 'a') as f:
+                    if y.dtype != torch.long:
+                        f.write(f"라벨 타입 이상: {y.dtype}, 값 예시: {y[:5]}\n")
+                    if (y < 0).any() or (y >= 10).any():
+                        f.write(f"라벨 범위 이상: {y.min()} ~ {y.max()}\n")
+                    if torch.isnan(y).any() or torch.isinf(y).any():
+                        f.write("라벨에 nan/inf 포함\n")
+                    if torch.isnan(x).any() or torch.isinf(x).any():
+                        f.write("입력 데이터에 nan/inf 포함\n")
+                    for name, param in client_model.named_parameters():
+                        if torch.isnan(param).any() or torch.isinf(param).any():
+                            f.write(f"{name} 파라미터에 nan/inf 포함\n")
+                        f.write(f"{name} min: {param.min().item()}, max: {param.max().item()}, mean: {param.mean().item()}\n")
+                # ======= 진단 코드 끝 =======
                 x, y = x.to(device), y.to(device)
                 optimizer.zero_grad()
-
-                # 정방향 계산
                 output = client_model(x)
                 loss_ce = criterion(output, y)
-
                 # 지식 증류 (동적 가중치)
                 if use_knowledge_distillation:
                     with torch.no_grad():
                         global_model.eval()
                         teacher_probs = global_model.get_probabilities(x, temp=2.0)
-
                     student_log_probs = torch.log_softmax(output/2.0, dim=1)
                     distillation_loss = nn.KLDivLoss(reduction='batchmean')(student_log_probs, teacher_probs)
-
-                    # 코사인 스케줄링을 통한 동적 가중치 조절
                     kd_weight = kd_alpha * (1 + math.cos(math.pi * round_idx / total_rounds))
                     loss = (1 - kd_weight) * loss_ce + kd_weight * distillation_loss
                 else:
                     loss = loss_ce
-
-                # FedProx 항 추가
                 prox_term = 0
                 for w, w_0 in zip(client_model.parameters(), global_model.parameters()):
                     prox_term += torch.sum((w - w_0) ** 2)
-
-                # 최종 손실
                 loss += (mu / 2) * prox_term
-
-                # 역전파 및 옵티마이저 스텝
+                # 손실값 nan/inf 방지
+                if math.isnan(loss.item()) or math.isinf(loss.item()):
+                    print("경고: 손실값이 nan/inf입니다. 입력 데이터/라벨을 확인하세요.")
+                    continue
                 loss.backward()
                 optimizer.step()
-
                 total_loss += loss_ce.item() * x.size(0)
                 total_samples += x.size(0)
 
@@ -215,21 +219,12 @@ def server_aggregate(global_model, client_states, client_losses, client_samples,
 
     # 새 글로벌 모델 상태 계산
     for key in global_dict.keys():
-        weighted_sum = torch.zeros_like(global_dict[key])
+        weighted_sum = torch.zeros_like(global_dict[key], dtype=torch.float32)
         for i, state in enumerate(client_states):
-            weighted_sum += weights[i] * state[key]
-
-        # 서버 모멘텀 적용
-        if use_server_momentum and server_velocity is not None:
-            if key not in server_velocity:
-                server_velocity[key] = torch.zeros_like(weighted_sum)
-
-            # 현재 업데이트
-            update = weighted_sum - global_dict[key]
-
-            # 모멘텀 업데이트
-            server_velocity[key] = momentum_beta * server_velocity[key] + (1 - momentum_beta) * update
-            global_dict[key] += server_velocity[key]
+            weighted_sum += weights[i] * state[key].float()
+        # 원래 파라미터가 long 타입이면 변환
+        if global_dict[key].dtype in [torch.int64, torch.long]:
+            global_dict[key] = weighted_sum.to(global_dict[key].dtype)
         else:
             global_dict[key] = weighted_sum
 
@@ -309,7 +304,7 @@ def prepare_dataset():
     return client_loaders, testloader, client_data_stats
 
 def partition_dataset(dataset, num_clients, alpha):
-    """디리클레 분포를 사용한 Non-IID 데이터 분할"""
+    """디리클레 분포를 사용한 Non-IID 데이터 분할 (각 클라이언트 최소 1개 샘플 보장)"""
     num_classes = 10
     targets = np.array(dataset.targets)
     client_indices = {i: [] for i in range(num_clients)}
@@ -318,6 +313,9 @@ def partition_dataset(dataset, num_clients, alpha):
     for k, idx_k in enumerate(class_indices):
         np.random.shuffle(idx_k)
         proportions = np.random.dirichlet([alpha] * num_clients)
+        # 최소 1% 이상 할당 보장
+        proportions = np.maximum(proportions, 1e-2)
+        proportions = proportions / proportions.sum()
         bounds = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
         splits = np.split(idx_k, bounds)
         for i, split in enumerate(splits):
@@ -325,6 +323,10 @@ def partition_dataset(dataset, num_clients, alpha):
 
     for i in client_indices:
         np.random.shuffle(client_indices[i])
+        # 만약 데이터가 0개면 무작위로 1개라도 할당
+        if len(client_indices[i]) == 0:
+            # 전체 데이터셋에서 무작위로 1개 할당
+            client_indices[i].append(np.random.choice(len(dataset)))
 
     # 클라이언트별 데이터 분포 시각화
     visualize_data_distribution(dataset, client_indices, num_classes, alpha)
@@ -411,21 +413,12 @@ def server_aggregate(global_model, client_states, client_losses, client_samples,
 
     # 새 글로벌 모델 상태 계산
     for key in global_dict.keys():
-        weighted_sum = torch.zeros_like(global_dict[key])
+        weighted_sum = torch.zeros_like(global_dict[key], dtype=torch.float32)
         for i, state in enumerate(client_states):
-            weighted_sum += weights[i] * state[key]
-
-        # 서버 모멘텀 적용
-        if use_server_momentum and server_velocity is not None:
-            if key not in server_velocity:
-                server_velocity[key] = torch.zeros_like(weighted_sum)
-
-            # 현재 업데이트
-            update = weighted_sum - global_dict[key]
-
-            # 모멘텀 업데이트
-            server_velocity[key] = momentum_beta * server_velocity[key] + (1 - momentum_beta) * update
-            global_dict[key] += server_velocity[key]
+            weighted_sum += weights[i] * state[key].float()
+        # 원래 파라미터가 long 타입이면 변환
+        if global_dict[key].dtype in [torch.int64, torch.long]:
+            global_dict[key] = weighted_sum.to(global_dict[key].dtype)
         else:
             global_dict[key] = weighted_sum
 
@@ -532,7 +525,7 @@ def federated_learning():
                 try:
                     client_model = SimpleCNN().to(device)
                     client_model.load_state_dict(global_model.state_dict())
-                    optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
+                    optimizer = optim.SGD(client_model.parameters(), lr=0.001, momentum=0.9)
 
                     updated_model, loss, samples = client_update(
                         client_model,
@@ -601,27 +594,36 @@ def federated_learning():
                     avg_loss = np.mean([client_losses[participating_clients.index(c)] for c in cluster_clients])
                     cluster_losses_per_round[i].append(avg_loss)
                 else:
-                    # 이 라운드에 클러스터에서 참여한 클라이언트가 없는 경우
                     if len(cluster_losses_per_round[i]) > 0:
-                        # 이전 라운드 손실 유지
                         cluster_losses_per_round[i].append(cluster_losses_per_round[i][-1])
                     else:
                         cluster_losses_per_round[i].append(0)
 
-            # 참여 클라이언트 간 공정성 점수 계산
-            if len(participating_clients) > 1:
-                fairness = 1 - (max(client_losses) - min(client_losses)) / max(client_losses)
+            # 참여 클라이언트 간 공정성 점수 계산 (nan/inf 방지)
+            valid_losses = [loss for loss in client_losses if not math.isinf(loss) and not math.isnan(loss)]
+            if len(valid_losses) > 1 and max(valid_losses) != 0:
+                fairness = 1 - (max(valid_losses) - min(valid_losses)) / max(valid_losses)
             else:
-                fairness = 1.0  # 참여 클라이언트가 1개면 불공정성 없음
+                fairness = 1.0
+            if math.isnan(fairness) or math.isinf(fairness):
+                print(f"경고: 공정성 값이 비정상적입니다. fairness={fairness}")
             fairness_scores.append(fairness)
 
             # 모델 평가
             accuracy = evaluate_model(global_model, testloader)
+            if math.isnan(accuracy) or math.isinf(accuracy):
+                print(f"경고: 정확도 값이 비정상적입니다. accuracy={accuracy}")
             accuracies.append(accuracy)
             logging.info(f"라운드 {r+1} 정확도: {accuracy:.2f}%")
             logging.info(f"라운드 {r+1} 공정성: {fairness:.3f}")
             logging.info(f"라운드 {r+1} 통신 비용: {round_bytes / (1024 * 1024):.2f} MB")
             logging.info(f"라운드 {r+1} 최적화된 통신 비용: {round_bytes_optimized / (1024 * 1024):.2f} MB")
+
+            # 라운드별 평균 loss 계산 (정상 손실만 평균)
+            round_loss = np.mean(valid_losses) if valid_losses else float('nan')
+
+            # ===== 라운드별 간결 출력 추가 =====
+            print(f"[Round {r+1}] Accuracy: {accuracy:.2f}% | Loss: {round_loss:.4f} | Comm: {round_bytes / (1024 * 1024):.2f} MB | Pruned Comm: {round_bytes_optimized / (1024 * 1024):.2f} MB")
 
         # 최종 모델 저장
         torch.save(global_model.state_dict(), 'enhanced_federated_model.pth')
