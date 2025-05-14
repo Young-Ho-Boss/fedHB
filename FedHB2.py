@@ -485,6 +485,30 @@ def federated_learning():
 
             logging.info(f"참여 클라이언트: {participating_clients}")
 
+            # 라운드별 통신 비용 계산
+            round_bytes = 0
+            round_bytes_optimized = 0
+
+            # 다운로드 단계: 서버 → 클라이언트 (글로벌 모델 배포)
+            download_size = model_size_bytes * len(participating_clients)
+            round_bytes += download_size
+
+            # 적응적 가지치기 임계값 계산
+            current_pruning_thr = adaptive_pruning_threshold(pruning_thr, r, num_rounds)
+
+            # 최적화된 다운로드 크기 계산 (가지치기 + 양자화)
+            compression_ratio = 1.0
+            if use_adaptive_pruning:
+                compression_ratio *= (1 - current_pruning_thr)
+
+            if use_quantization:
+                # 간소화된 계산: 컨볼루션(8비트)과 완전연결(16비트) 레이어의 압축률 평균
+                avg_quantization_bits = (quantization_bits_conv + quantization_bits_fc) / 2
+                compression_ratio *= (avg_quantization_bits / 32)
+
+            optimized_download_size = model_size_bytes * compression_ratio * len(participating_clients)
+            round_bytes_optimized += optimized_download_size
+
             # 클라이언트 학습 결과 저장용 변수
             client_states = []
             client_losses = []
@@ -521,6 +545,22 @@ def federated_learning():
                     del client_model
                     torch.cuda.empty_cache()
 
+            # 업로드 단계: 클라이언트 → 서버 (로컬 모델 전송)
+            upload_size = model_size_bytes * len(participating_clients)
+            round_bytes += upload_size
+
+            # 최적화된 업로드 크기
+            optimized_upload_size = model_size_bytes * compression_ratio * len(participating_clients)
+            round_bytes_optimized += optimized_upload_size
+
+            # 라운드별 통신 비용 합산
+            total_bytes_transferred += round_bytes
+            total_bytes_transferred_optimized += round_bytes_optimized
+
+            # 현재 라운드 통신 비용 저장
+            communication_costs.append(round_bytes)
+            pruned_communication_costs.append(round_bytes_optimized)
+
             # 서버에서 글로벌 모델 업데이트
             global_model, client_weights = server_aggregate(
                 global_model,
@@ -534,14 +574,59 @@ def federated_learning():
             # 글로벌 모델 체크포인트 저장
             save_checkpoint(global_model, None, r, is_global=True)
 
+            # 클라이언트 중요도 업데이트 (다음 라운드 활성 클라이언트 선택에 사용)
+            if use_importance_sampling:
+                for i, cid in enumerate(participating_clients):
+                    client_importance[cid] = 0.8 * client_importance[cid] + 0.2 * client_weights[i]
+                # 중요도 정규화
+                client_importance = client_importance / client_importance.sum()
+
+            # 클러스터별 평균 손실 계산
+            for i, cluster in enumerate(clusters):
+                cluster_clients = [c for c in cluster if c in participating_clients]
+                if cluster_clients:
+                    avg_loss = np.mean([client_losses[participating_clients.index(c)] for c in cluster_clients])
+                    cluster_losses_per_round[i].append(avg_loss)
+                else:
+                    # 이 라운드에 클러스터에서 참여한 클라이언트가 없는 경우
+                    if len(cluster_losses_per_round[i]) > 0:
+                        # 이전 라운드 손실 유지
+                        cluster_losses_per_round[i].append(cluster_losses_per_round[i][-1])
+                    else:
+                        cluster_losses_per_round[i].append(0)
+
+            # 참여 클라이언트 간 공정성 점수 계산
+            if len(participating_clients) > 1:
+                fairness = 1 - (max(client_losses) - min(client_losses)) / max(client_losses)
+            else:
+                fairness = 1.0  # 참여 클라이언트가 1개면 불공정성 없음
+            fairness_scores.append(fairness)
+
             # 모델 평가
             accuracy = evaluate_model(global_model, testloader)
             accuracies.append(accuracy)
             logging.info(f"라운드 {r+1} 정확도: {accuracy:.2f}%")
+            logging.info(f"라운드 {r+1} 공정성: {fairness:.3f}")
+            logging.info(f"라운드 {r+1} 통신 비용: {round_bytes / (1024 * 1024):.2f} MB")
+            logging.info(f"라운드 {r+1} 최적화된 통신 비용: {round_bytes_optimized / (1024 * 1024):.2f} MB")
 
         # 최종 모델 저장
         torch.save(global_model.state_dict(), 'enhanced_federated_model.pth')
         logging.info("훈련 완료!")
+        logging.info(f"최종 정확도: {accuracies[-1]:.2f}%")
+        logging.info(f"총 통신 비용: {total_bytes_transferred / (1024 * 1024):.2f} MB")
+        logging.info(f"최적화된 총 통신 비용: {total_bytes_transferred_optimized / (1024 * 1024):.2f} MB")
+
+        # 성능 시각화
+        visualize_results(
+            accuracies,
+            cluster_losses_per_round,
+            fairness_scores,
+            communication_costs,
+            pruned_communication_costs,
+            client_importance,
+            num_rounds
+        )
 
         return global_model, accuracies, client_importance
 
