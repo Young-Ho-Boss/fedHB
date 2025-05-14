@@ -54,12 +54,14 @@ quantization_bits_conv = 8  # 컨볼루션 레이어 양자화 비트
 quantization_bits_fc = 16   # 완전연결 레이어 양자화 비트
 
 # GPU 설정
-if not torch.cuda.is_available():
-    raise RuntimeError("GPU가 필요합니다. CUDA가 설치되어 있는지 확인해주세요.")
-device = torch.device('cuda')
-torch.cuda.empty_cache()  # GPU 메모리 초기화
-print(f"GPU 사용: {torch.cuda.get_device_name(0)}")
-print(f"사용 가능한 GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    torch.cuda.empty_cache()  # GPU 메모리 초기화
+    print(f"GPU 사용: {torch.cuda.get_device_name(0)}")
+    print(f"사용 가능한 GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+else:
+    device = torch.device('cpu')
+    print("GPU를 사용할 수 없습니다. CPU로 실행합니다.")
 
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)  # GPU 시드 설정
@@ -93,6 +95,16 @@ class SimpleCNN(nn.Module):
         x = self.features(x)
         x = x.view(x.size(0), -1)  # flatten
         return self.classifier(x)
+
+    def get_probabilities(self, x, temp=1.0):
+        """Temperature scaling softmax 확률 분포 반환 (자동 디바이스)"""
+        self.eval()
+        device = next(self.parameters()).device
+        x = x.to(device)
+        with torch.no_grad():
+            logits = self.forward(x)
+            probs = torch.softmax(logits / temp, dim=1)
+        return probs
 
 # 수정 2: 구조화된 업데이트 적용 (Algorithm 1)
 def structured_update(params):
