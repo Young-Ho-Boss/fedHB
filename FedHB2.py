@@ -10,6 +10,23 @@ import copy
 from sklearn.metrics.pairwise import pairwise_distances
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
+import os
+import logging
+from datetime import datetime
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'federated_learning_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# 체크포인트 디렉토리 생성
+CHECKPOINT_DIR = 'checkpoints'
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # 1. 설정
 num_clients = 5
@@ -47,6 +64,17 @@ print(f"사용 가능한 GPU 메모리: {torch.cuda.get_device_properties(0).tot
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)  # GPU 시드 설정
 
+# 수정 1: Enhancer 레이어 정의 (Classifier 계층)
+class EnhancedClassifier(nn.Module):
+    def __init__(self, in_features=256, out_features=10, rank=32):
+        super().__init__()
+        # 저랭크 파라미터화 (Low-rank Factorization)
+        self.A = nn.Parameter(torch.randn(in_features, rank))
+        self.B = nn.Parameter(torch.randn(rank, out_features))
+        
+    def forward(self, x):
+        return x @ (self.A @ self.B)  # W = A*B (Low-rank)
+    
 # 2. 모델 정의
 class SimpleCNN(nn.Module):
     def __init__(self):
@@ -59,22 +87,141 @@ class SimpleCNN(nn.Module):
             nn.ReLU(),
             nn.MaxPool2d(2)
         )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64*8*8, 256),
-            nn.ReLU(),
-            nn.Linear(256, 10)
-        )
-
+        self.classifier = EnhancedClassifier()  # Enhancer로 교체
+        
     def forward(self, x):
         x = self.features(x)
-        x = self.classifier(x)
-        return x
+        return self.classifier(x)
 
-    # 소프트맥스 출력 (지식 증류에 사용)
-    def get_probabilities(self, x, temp=1.0):
-        logits = self(x)
-        return torch.nn.functional.softmax(logits / temp, dim=1)
+# 수정 2: 구조화된 업데이트 적용 (Algorithm 1)
+def structured_update(params):
+    for name, param in params.items():
+        if 'classifier' in name:  # Enhancer 계층만 처리
+            # Random Masking (검색 결과[2]의 전략)
+            mask = torch.rand_like(param) > 0.8  # 20% 유지
+            param.data *= mask.float()
+            # 양자화 (검색 결과[5] QSGD 기반)
+            param.data = quantize(param.data, bits=4)
+
+# 수정 3: 클라이언트 학습 시 Enhancer만 업데이트
+def client_update(client_model, data_loader, optimizer, criterion, global_model, round_idx, total_rounds, pruning_threshold, kd_alpha):
+    """클라이언트 로컬 학습 함수"""
+    try:
+        client_model.train()
+        total_loss = 0.0
+        total_samples = 0
+
+        # FedProx 파라미터
+        mu = 0.01  # 프록시멀 항 계수
+
+        for epoch in range(local_epochs):
+            for x, y in data_loader:
+                x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+
+                # 정방향 계산
+                output = client_model(x)
+                loss_ce = criterion(output, y)
+
+                # 지식 증류 (동적 가중치)
+                if use_knowledge_distillation:
+                    with torch.no_grad():
+                        global_model.eval()
+                        teacher_probs = global_model.get_probabilities(x, temp=2.0)
+
+                    student_log_probs = torch.log_softmax(output/2.0, dim=1)
+                    distillation_loss = nn.KLDivLoss(reduction='batchmean')(student_log_probs, teacher_probs)
+
+                    # 코사인 스케줄링을 통한 동적 가중치 조절
+                    kd_weight = kd_alpha * (1 + math.cos(math.pi * round_idx / total_rounds))
+                    loss = (1 - kd_weight) * loss_ce + kd_weight * distillation_loss
+                else:
+                    loss = loss_ce
+
+                # FedProx 항 추가
+                prox_term = 0
+                for w, w_0 in zip(client_model.parameters(), global_model.parameters()):
+                    prox_term += torch.sum((w - w_0) ** 2)
+
+                # 최종 손실
+                loss += (mu / 2) * prox_term
+
+                # 역전파 및 옵티마이저 스텝
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss_ce.item() * x.size(0)
+                total_samples += x.size(0)
+
+        # 가지치기 (pruning)
+        if use_adaptive_pruning:
+            with torch.no_grad():
+                # 모든 가중치의 절대값 수집
+                all_weights = torch.cat([p.view(-1).abs() for p in client_model.parameters() if p.requires_grad])
+
+                # 임계값 계산
+                threshold = torch.quantile(all_weights, pruning_threshold)
+
+                # 가지치기 적용
+                for name, param in client_model.named_parameters():
+                    if 'weight' in name:
+                        mask = param.abs() > threshold
+                        param.mul_(mask)
+
+        # 양자화 적용
+        if use_quantization:
+            with torch.no_grad():
+                for name, param in client_model.named_parameters():
+                    if 'weight' in name:
+                        param.copy_(mixed_precision_quantize(param, name))
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
+        return client_model, avg_loss, total_samples
+
+    finally:
+        # 메모리 해제
+        torch.cuda.empty_cache()
+
+# 수정 4: 서버 집계 최적화 (Algorithm 2)
+def server_aggregate(global_model, client_states, client_losses, client_samples, server_velocity=None, momentum_beta=0.9):
+    """클라이언트 모델 집계 및 서버 모델 업데이트"""
+    global_dict = global_model.state_dict()
+
+    if use_importance_sampling:
+        # 손실 기반 가중치 계산 (높은 손실 = 더 많은 가중치)
+        weights = np.array([loss ** q for loss in client_losses])
+        total_weight = np.sum(weights)
+        if total_weight > 0:
+            weights = weights / total_weight
+        else:
+            # 가중치를 계산할 수 없는 경우 샘플 크기 비례로 가중치 설정
+            weights = np.array(client_samples) / np.sum(client_samples) if np.sum(client_samples) > 0 else np.ones(len(client_samples)) / len(client_samples)
+    else:
+        # 기본 FedAvg: 데이터 크기에 비례한 가중치
+        weights = np.array(client_samples) / np.sum(client_samples) if np.sum(client_samples) > 0 else np.ones(len(client_samples)) / len(client_samples)
+
+    # 새 글로벌 모델 상태 계산
+    for key in global_dict.keys():
+        weighted_sum = torch.zeros_like(global_dict[key])
+        for i, state in enumerate(client_states):
+            weighted_sum += weights[i] * state[key]
+
+        # 서버 모멘텀 적용
+        if use_server_momentum and server_velocity is not None:
+            if key not in server_velocity:
+                server_velocity[key] = torch.zeros_like(weighted_sum)
+
+            # 현재 업데이트
+            update = weighted_sum - global_dict[key]
+
+            # 모멘텀 업데이트
+            server_velocity[key] = momentum_beta * server_velocity[key] + (1 - momentum_beta) * update
+            global_dict[key] += server_velocity[key]
+        else:
+            global_dict[key] = weighted_sum
+
+    global_model.load_state_dict(global_dict)
+    return global_model, weights
 
 # 3. 통신 최적화 함수들
 def calculate_model_size(model):
@@ -228,80 +375,6 @@ def visualize_data_distribution(dataset, client_indices, num_classes, alpha):
     plt.grid(axis='y', alpha=0.3)
     plt.savefig('data_distribution.png')
 
-# 5. 클라이언트 학습 함수
-def client_update(client_model, data_loader, optimizer, criterion, global_model, round_idx, total_rounds, pruning_threshold, kd_alpha):
-    """클라이언트 로컬 학습 함수"""
-    client_model.train()
-    total_loss = 0.0
-    total_samples = 0
-
-    # FedProx 파라미터
-    mu = 0.01  # 프록시멀 항 계수
-
-    for epoch in range(local_epochs):
-        for x, y in data_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-
-            # 정방향 계산
-            output = client_model(x)
-            loss_ce = criterion(output, y)
-
-            # 지식 증류 (동적 가중치)
-            if use_knowledge_distillation:
-                with torch.no_grad():
-                    global_model.eval()
-                    teacher_probs = global_model.get_probabilities(x, temp=2.0)
-
-                student_log_probs = torch.log_softmax(output/2.0, dim=1)
-                distillation_loss = nn.KLDivLoss(reduction='batchmean')(student_log_probs, teacher_probs)
-
-                # 코사인 스케줄링을 통한 동적 가중치 조절
-                kd_weight = kd_alpha * (1 + math.cos(math.pi * round_idx / total_rounds))
-                loss = (1 - kd_weight) * loss_ce + kd_weight * distillation_loss
-            else:
-                loss = loss_ce
-
-            # FedProx 항 추가
-            prox_term = 0
-            for w, w_0 in zip(client_model.parameters(), global_model.parameters()):
-                prox_term += torch.sum((w - w_0) ** 2)
-
-            # 최종 손실
-            loss += (mu / 2) * prox_term
-
-            # 역전파 및 옵티마이저 스텝
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss_ce.item() * x.size(0)  # 원래 분류 손실만 기록
-            total_samples += x.size(0)
-
-    # 가지치기 (pruning)
-    if use_adaptive_pruning:
-        with torch.no_grad():
-            # 모든 가중치의 절대값 수집
-            all_weights = torch.cat([p.view(-1).abs() for p in client_model.parameters() if p.requires_grad])
-
-            # 임계값 계산
-            threshold = torch.quantile(all_weights, pruning_threshold)
-
-            # 가지치기 적용
-            for name, param in client_model.named_parameters():
-                if 'weight' in name:
-                    mask = param.abs() > threshold
-                    param.mul_(mask)
-
-    # 양자화 적용
-    if use_quantization:
-        with torch.no_grad():
-            for name, param in client_model.named_parameters():
-                if 'weight' in name:
-                    param.copy_(mixed_precision_quantize(param, name))
-
-    avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
-    return client_model, avg_loss, total_samples
-
 # 6. 비동기 병렬 클라이언트 학습 함수 제거
 # async_client_train 함수 삭제
 
@@ -365,194 +438,116 @@ def evaluate_model(model, testloader):
 # 9. 통합 연합 학습 함수
 def federated_learning():
     """향상된 연합 학습 프레임워크 실행 함수"""
-    # 데이터셋 준비
-    client_loaders, testloader, client_data_stats = prepare_dataset()
-    clusters = client_data_stats["clusters"]
+    try:
+        # 데이터셋 준비
+        client_loaders, testloader, client_data_stats = prepare_dataset()
+        clusters = client_data_stats["clusters"]
 
-    # 모델 초기화
-    global_model = SimpleCNN().to(device)
-    criterion = nn.CrossEntropyLoss()
+        # 모델 초기화
+        global_model = SimpleCNN().to(device)
+        criterion = nn.CrossEntropyLoss()
 
-    # 모델 크기 계산
-    num_params, model_size_bytes = calculate_model_size(global_model)
-    model_size_mb = model_size_bytes / (1024 * 1024)
-    print(f"모델 파라미터 수: {num_params:,}")
-    print(f"모델 크기: {model_size_bytes:,} bytes ({model_size_mb:.2f} MB)")
+        # 모델 크기 계산
+        num_params, model_size_bytes = calculate_model_size(global_model)
+        model_size_mb = model_size_bytes / (1024 * 1024)
+        logging.info(f"모델 파라미터 수: {num_params:,}")
+        logging.info(f"모델 크기: {model_size_bytes:,} bytes ({model_size_mb:.2f} MB)")
 
-    # 모니터링 지표 초기화
-    accuracies = []
-    communication_costs = []
-    pruned_communication_costs = []
-    client_importance = np.ones(num_clients) / num_clients  # 초기 클라이언트 중요도
-    fairness_scores = []
-    cluster_losses_per_round = [[] for _ in range(len(clusters))]
+        # 모니터링 지표 초기화
+        accuracies = []
+        communication_costs = []
+        pruned_communication_costs = []
+        client_importance = np.ones(num_clients) / num_clients
+        fairness_scores = []
+        cluster_losses_per_round = [[] for _ in range(len(clusters))]
 
-    # 서버 모멘텀 초기화
-    server_velocity = OrderedDict() if use_server_momentum else None
+        # 서버 모멘텀 초기화
+        server_velocity = OrderedDict() if use_server_momentum else None
 
-    # 통신 비용 및 메모리 사용량 모니터링
-    total_bytes_transferred = 0
-    total_bytes_transferred_optimized = 0
+        # 통신 비용 및 메모리 사용량 모니터링
+        total_bytes_transferred = 0
+        total_bytes_transferred_optimized = 0
 
-    # 메인 학습 루프
-    for r in range(num_rounds):
-        print(f"\n===== 라운드 {r+1}/{num_rounds} =====")
+        # 메인 학습 루프
+        for r in range(num_rounds):
+            logging.info(f"\n===== 라운드 {r+1}/{num_rounds} =====")
 
-        # 활성 클라이언트 선택 (전체 클라이언트 중 일부만 참여)
-        participating_clients = list(range(num_clients))
-        if use_active_client_selection and r > 0:
-            # 중요도에 비례하여 클라이언트 샘플링
-            num_active = max(2, num_clients // 2)  # 최소 2개 이상 클라이언트 참여
-            participating_clients = np.random.choice(
-                num_clients,
-                size=num_active,
-                replace=False,
-                p=client_importance
-            ).tolist()
+            # 활성 클라이언트 선택
+            participating_clients = list(range(num_clients))
+            if use_active_client_selection and r > 0:
+                num_active = max(2, num_clients // 2)
+                participating_clients = np.random.choice(
+                    num_clients,
+                    size=num_active,
+                    replace=False,
+                    p=client_importance
+                ).tolist()
 
-        print(f"참여 클라이언트: {participating_clients}")
+            logging.info(f"참여 클라이언트: {participating_clients}")
 
-        # 라운드별 통신 비용 계산
-        round_bytes = 0
-        round_bytes_optimized = 0
+            # 클라이언트 학습 결과 저장용 변수
+            client_states = []
+            client_losses = []
+            client_sample_sizes = []
 
-        # 다운로드 단계: 서버 → 클라이언트 (글로벌 모델 배포)
-        download_size = model_size_bytes * len(participating_clients)
-        round_bytes += download_size
+            # 순차적 클라이언트 학습
+            for cid in participating_clients:
+                try:
+                    client_model = SimpleCNN().to(device)
+                    client_model.load_state_dict(global_model.state_dict())
+                    optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
 
-        # 적응적 가지치기 임계값 계산
-        current_pruning_thr = adaptive_pruning_threshold(pruning_thr, r, num_rounds)
+                    updated_model, loss, samples = client_update(
+                        client_model,
+                        client_loaders[cid],
+                        optimizer,
+                        criterion,
+                        global_model,
+                        r,
+                        num_rounds,
+                        current_pruning_thr,
+                        kd_alpha
+                    )
 
-        # 최적화된 다운로드 크기 계산 (가지치기 + 양자화)
-        compression_ratio = 1.0
-        if use_adaptive_pruning:
-            compression_ratio *= (1 - current_pruning_thr)
+                    # 클라이언트 체크포인트 저장
+                    save_checkpoint(updated_model, optimizer, r, client_id=cid)
 
-        if use_quantization:
-            # 간소화된 계산: 컨볼루션(8비트)과 완전연결(16비트) 레이어의 압축률 평균
-            avg_quantization_bits = (quantization_bits_conv + quantization_bits_fc) / 2
-            compression_ratio *= (avg_quantization_bits / 32)
+                    client_states.append(updated_model.state_dict())
+                    client_losses.append(loss)
+                    client_sample_sizes.append(samples)
 
-        optimized_download_size = model_size_bytes * compression_ratio * len(participating_clients)
-        round_bytes_optimized += optimized_download_size
+                finally:
+                    # 메모리 해제
+                    del client_model
+                    torch.cuda.empty_cache()
 
-        # 클라이언트 학습 결과 저장용 변수
-        client_states = []
-        client_losses = []
-        client_sample_sizes = []
-
-        # 순차적 클라이언트 학습
-        for cid in participating_clients:
-            client_model = SimpleCNN().to(device)
-            client_model.load_state_dict(global_model.state_dict())
-            optimizer = optim.SGD(client_model.parameters(), lr=0.01, momentum=0.9)
-
-            updated_model, loss, samples = client_update(
-                client_model,
-                client_loaders[cid],
-                optimizer,
-                criterion,
+            # 서버에서 글로벌 모델 업데이트
+            global_model, client_weights = server_aggregate(
                 global_model,
-                r,
-                num_rounds,
-                current_pruning_thr,
-                kd_alpha
+                client_states,
+                client_losses,
+                client_sample_sizes,
+                server_velocity,
+                momentum_beta
             )
 
-            client_states.append(updated_model.state_dict())
-            client_losses.append(loss)
-            client_sample_sizes.append(samples)
+            # 글로벌 모델 체크포인트 저장
+            save_checkpoint(global_model, None, r, is_global=True)
 
-        # 업로드 단계: 클라이언트 → 서버 (로컬 모델 전송)
-        upload_size = model_size_bytes * len(participating_clients)
-        round_bytes += upload_size
+            # 모델 평가
+            accuracy = evaluate_model(global_model, testloader)
+            accuracies.append(accuracy)
+            logging.info(f"라운드 {r+1} 정확도: {accuracy:.2f}%")
 
-        # 최적화된 업로드 크기
-        optimized_upload_size = model_size_bytes * compression_ratio * len(participating_clients)
-        round_bytes_optimized += optimized_upload_size
+        # 최종 모델 저장
+        torch.save(global_model.state_dict(), 'enhanced_federated_model.pth')
+        logging.info("훈련 완료!")
 
-        # 라운드별 통신 비용 합산
-        total_bytes_transferred += round_bytes
-        total_bytes_transferred_optimized += round_bytes_optimized
+        return global_model, accuracies, client_importance
 
-        # 현재 라운드 통신 비용 저장
-        communication_costs.append(round_bytes)
-        pruned_communication_costs.append(round_bytes_optimized)
-
-        # 서버에서 글로벌 모델 업데이트
-        global_model, client_weights = server_aggregate(
-            global_model,
-            client_states,
-            client_losses,
-            client_sample_sizes,
-            server_velocity,
-            momentum_beta
-        )
-
-        # 클라이언트 중요도 업데이트 (다음 라운드 활성 클라이언트 선택에 사용)
-        if use_importance_sampling:
-            for i, cid in enumerate(participating_clients):
-                client_importance[cid] = 0.8 * client_importance[cid] + 0.2 * client_weights[i]
-            # 중요도 정규화
-            client_importance = client_importance / client_importance.sum()
-
-        # 클러스터별 평균 손실 계산
-        for i, cluster in enumerate(clusters):
-            cluster_clients = [c for c in cluster if c in participating_clients]
-            if cluster_clients:
-                avg_loss = np.mean([client_losses[participating_clients.index(c)] for c in cluster_clients])
-                cluster_losses_per_round[i].append(avg_loss)
-            else:
-                # 이 라운드에 클러스터에서 참여한 클라이언트가 없는 경우
-                if len(cluster_losses_per_round[i]) > 0:
-                    # 이전 라운드 손실 유지
-                    cluster_losses_per_round[i].append(cluster_losses_per_round[i][-1])
-                else:
-                    cluster_losses_per_round[i].append(0)
-
-        # 참여 클라이언트 간 공정성 점수 계산
-        if len(participating_clients) > 1:
-            fairness = 1 - (max(client_losses) - min(client_losses)) / max(client_losses)
-        else:
-            fairness = 1.0  # 참여 클라이언트가 1개면 불공정성 없음
-        fairness_scores.append(fairness)
-
-        # 모델 평가
-        accuracy = evaluate_model(global_model, testloader)
-        accuracies.append(accuracy)
-
-        # 라운드 결과 출력
-        print(f"라운드 {r+1}/{num_rounds} 결과:")
-        print(f"  정확도: {accuracy:.2f}%")
-        print(f"  공정성: {fairness:.3f}")
-        print(f"  클라이언트 손실: {np.round(client_losses, 3)}")
-        print(f"  클라이언트 가중치: {np.round(client_weights, 3)}")
-        print(f"  통신 비용: {round_bytes / (1024 * 1024):.2f} MB")
-        print(f"  최적화된 통신 비용: {round_bytes_optimized / (1024 * 1024):.2f} MB")
-        print(f"  절감율: {(1 - round_bytes_optimized / round_bytes) * 100:.1f}%")
-
-    # 최종 결과 출력
-    print("\n===== 훈련 완료 =====")
-    print(f"최종 정확도: {accuracies[-1]:.2f}%")
-    print(f"총 통신 비용: {total_bytes_transferred / (1024 * 1024):.2f} MB")
-    print(f"최적화된 총 통신 비용: {total_bytes_transferred_optimized / (1024 * 1024):.2f} MB")
-    print(f"총 통신 비용 절감: {(1 - total_bytes_transferred_optimized / total_bytes_transferred) * 100:.1f}%")
-
-    # 성능 시각화
-    visualize_results(
-        accuracies,
-        cluster_losses_per_round,
-        fairness_scores,
-        communication_costs,
-        pruned_communication_costs,
-        client_importance,
-        num_rounds
-    )
-
-    # 최종 모델 저장
-    torch.save(global_model.state_dict(), 'enhanced_federated_model.pth')
-
-    return global_model, accuracies, client_importance
+    except Exception as e:
+        logging.error(f"학습 중 오류 발생: {str(e)}")
+        raise
 
 # 10. 결과 시각화 함수
 def visualize_results(accuracies, cluster_losses, fairness_scores, communication_costs,
@@ -715,6 +710,34 @@ def hyperparameter_optimization(param_grid, n_trials=5):
     use_server_momentum = best_params.get('use_server_momentum', use_server_momentum)
 
     return best_params, results
+
+def save_checkpoint(model, optimizer, epoch, client_id=None, is_global=False):
+    """체크포인트 저장 함수"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+    }
+    
+    if is_global:
+        filename = f'global_model_epoch_{epoch}.pth'
+    else:
+        filename = f'client_{client_id}_epoch_{epoch}.pth'
+    
+    path = os.path.join(CHECKPOINT_DIR, filename)
+    torch.save(checkpoint, path)
+    logging.info(f'체크포인트 저장됨: {path}')
+
+def load_checkpoint(model, optimizer, path):
+    """체크포인트 로드 함수"""
+    if os.path.exists(path):
+        checkpoint = torch.load(path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if optimizer and checkpoint['optimizer_state_dict']:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        logging.info(f'체크포인트 로드됨: {path}')
+        return checkpoint['epoch']
+    return 0
 
 # 메인 실행
 if __name__ == "__main__":
