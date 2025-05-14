@@ -66,7 +66,7 @@ torch.cuda.manual_seed(0)  # GPU 시드 설정
 
 # 수정 1: Enhancer 레이어 정의 (Classifier 계층)
 class EnhancedClassifier(nn.Module):
-    def __init__(self, in_features=256, out_features=10, rank=32):
+    def __init__(self, in_features=4096, out_features=10, rank=32):
         super().__init__()
         # 저랭크 파라미터화 (Low-rank Factorization)
         self.A = nn.Parameter(torch.randn(in_features, rank))
@@ -87,10 +87,11 @@ class SimpleCNN(nn.Module):
             nn.ReLU(),
             nn.MaxPool2d(2)
         )
-        self.classifier = EnhancedClassifier()  # Enhancer로 교체
+        self.classifier = EnhancedClassifier()  # in_features=4096, out_features=10, rank=32
         
     def forward(self, x):
         x = self.features(x)
+        x = x.view(x.size(0), -1)  # flatten
         return self.classifier(x)
 
 # 수정 2: 구조화된 업데이트 적용 (Algorithm 1)
