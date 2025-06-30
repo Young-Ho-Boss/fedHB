@@ -27,7 +27,7 @@ logging.basicConfig(
 num_clients = 5
 batch_size = 128  # 배치 크기 증가로 효율성 향상
 input_dim = 3 * 32 * 32
-num_rounds = 200  # 라운드 수 감소
+num_rounds = 10  # 테스트용으로 라운드 수 감소
 local_epochs = 3  # 로컬 에포크 감소
 q = 1.2
 alpha = 0.5
@@ -35,10 +35,10 @@ pruning_thr = 0.15
 momentum_beta = 0.9
 kd_alpha = 0.5
 
-# 베이지안 파라미터 추가
-kl_weight = 0.01  # KL 발산 가중치
-num_samples = 5   # Monte Carlo 샘플링 수
-prior_std = 1.0   # 사전 분포 표준편차
+# 베이지안 파라미터 (안정화된 버전)
+kl_weight = 0.001  # 매우 작은 KL 가중치로 시작
+num_samples = 3    # 샘플 수 감소
+prior_std = 0.1    # 작은 사전 분포 표준편차
 
 # 개선 옵션 설정 (선택적 활성화)
 use_adaptive_pruning = True
@@ -52,7 +52,7 @@ use_bayesian = True  # 베이지안 모드 활성화
 # 체크포인트 설정 (최적화)
 CHECKPOINT_DIR = 'checkpoints'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-SAVE_CHECKPOINT = False  # 체크포인트 저장 비활성화
+SAVE_CHECKPOINTS = False  # 체크포인트 저장 비활성화
 
 # GPU 설정
 if torch.cuda.is_available():
@@ -67,60 +67,65 @@ torch.manual_seed(42)  # 시드 고정
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
-# 2. 베이지안 신경망 레이어 추가
-class BayesianLinear(nn.Module):
-    """베이지안 선형 레이어 - 가중치와 편향에 대한 불확실성 모델링"""
-    def __init__(self, in_features, out_features, prior_std=1.0):
+# 2. 안정화된 베이지안 신경망 레이어
+class StableBayesianLinear(nn.Module):
+    """안정화된 베이지안 선형 레이어"""
+    def __init__(self, in_features, out_features, prior_std=0.1):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.prior_std = prior_std
         
-        # 평균 파라미터 (μ)
-        self.weight_mu = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
-        self.bias_mu = nn.Parameter(torch.randn(out_features) * 0.1)
+        # 평균 파라미터 (안정적인 초기화)
+        self.weight_mu = nn.Parameter(torch.randn(out_features, in_features) * 0.01)
+        self.bias_mu = nn.Parameter(torch.randn(out_features) * 0.01)
         
-        # 로그 분산 파라미터 (log σ²)
-        self.weight_log_var = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
-        self.bias_log_var = nn.Parameter(torch.randn(out_features) * 0.1)
+        # 로그 분산 파라미터 (작은 값으로 초기화)
+        self.weight_log_var = nn.Parameter(torch.randn(out_features, in_features) * 0.01 - 3.0)
+        self.bias_log_var = nn.Parameter(torch.randn(out_features) * 0.01 - 3.0)
         
-        # 사전 분포 (가우시안)
+        # 사전 분포
         self.prior_mu = 0.0
         self.prior_std = prior_std
     
     def forward(self, x, sample=True):
         if sample and self.training:
-            # 재매개화 트릭으로 샘플링
-            weight = self.weight_mu + torch.exp(0.5 * self.weight_log_var) * torch.randn_like(self.weight_mu)
-            bias = self.bias_mu + torch.exp(0.5 * self.bias_log_var) * torch.randn_like(self.bias_mu)
+            # 분산 클리핑으로 안정성 확보
+            weight_std = torch.clamp(torch.exp(0.5 * self.weight_log_var), min=1e-6, max=1.0)
+            bias_std = torch.clamp(torch.exp(0.5 * self.bias_log_var), min=1e-6, max=1.0)
+            
+            # 재매개화 트릭
+            weight = self.weight_mu + weight_std * torch.randn_like(self.weight_mu)
+            bias = self.bias_mu + bias_std * torch.randn_like(self.bias_mu)
         else:
-            # 추론 시에는 평균 사용
             weight = self.weight_mu
             bias = self.bias_mu
             
         return F.linear(x, weight, bias)
     
     def kl_divergence(self):
-        """사전 분포와 사후 분포 간의 KL 발산 계산"""
+        """안정적인 KL 발산 계산"""
         # 가중치 KL 발산
-        weight_kl = -0.5 * torch.sum(1 + self.weight_log_var - 
-                                   (self.weight_mu - self.prior_mu).pow(2) / self.prior_std**2 - 
-                                   self.weight_log_var.exp())
+        weight_var = torch.exp(self.weight_log_var)
+        weight_kl = 0.5 * torch.sum(
+            (self.weight_mu - self.prior_mu).pow(2) / self.prior_std**2 + 
+            weight_var / self.prior_std**2 - 
+            self.weight_log_var + torch.log(self.prior_std**2)
+        )
         
         # 편향 KL 발산
-        bias_kl = -0.5 * torch.sum(1 + self.bias_log_var - 
-                                  (self.bias_mu - self.prior_mu).pow(2) / self.prior_std**2 - 
-                                  self.bias_log_var.exp())
+        bias_var = torch.exp(self.bias_log_var)
+        bias_kl = 0.5 * torch.sum(
+            (self.bias_mu - self.prior_mu).pow(2) / self.prior_std**2 + 
+            bias_var / self.prior_std**2 - 
+            self.bias_log_var + torch.log(self.prior_std**2)
+        )
         
         return weight_kl + bias_kl
-    
-    def get_posterior_params(self):
-        """사후 분포 파라미터 반환"""
-        return (self.weight_mu, self.bias_mu), (self.weight_log_var, self.bias_log_var)
 
-class BayesianConv2d(nn.Module):
-    """베이지안 컨볼루션 레이어"""
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, prior_std=1.0):
+class StableBayesianConv2d(nn.Module):
+    """안정화된 베이지안 컨볼루션 레이어"""
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, prior_std=0.1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -130,12 +135,12 @@ class BayesianConv2d(nn.Module):
         self.prior_std = prior_std
         
         # 평균 파라미터
-        self.weight_mu = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1)
-        self.bias_mu = nn.Parameter(torch.randn(out_channels) * 0.1)
+        self.weight_mu = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.01)
+        self.bias_mu = nn.Parameter(torch.randn(out_channels) * 0.01)
         
         # 로그 분산 파라미터
-        self.weight_log_var = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1)
-        self.bias_log_var = nn.Parameter(torch.randn(out_channels) * 0.1)
+        self.weight_log_var = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.01 - 3.0)
+        self.bias_log_var = nn.Parameter(torch.randn(out_channels) * 0.01 - 3.0)
         
         # 사전 분포
         self.prior_mu = 0.0
@@ -143,8 +148,12 @@ class BayesianConv2d(nn.Module):
     
     def forward(self, x, sample=True):
         if sample and self.training:
-            weight = self.weight_mu + torch.exp(0.5 * self.weight_log_var) * torch.randn_like(self.weight_mu)
-            bias = self.bias_mu + torch.exp(0.5 * self.bias_log_var) * torch.randn_like(self.bias_mu)
+            # 분산 클리핑
+            weight_std = torch.clamp(torch.exp(0.5 * self.weight_log_var), min=1e-6, max=1.0)
+            bias_std = torch.clamp(torch.exp(0.5 * self.bias_log_var), min=1e-6, max=1.0)
+            
+            weight = self.weight_mu + weight_std * torch.randn_like(self.weight_mu)
+            bias = self.bias_mu + bias_std * torch.randn_like(self.bias_mu)
         else:
             weight = self.weight_mu
             bias = self.bias_mu
@@ -152,32 +161,40 @@ class BayesianConv2d(nn.Module):
         return F.conv2d(x, weight, bias, stride=self.stride, padding=self.padding)
     
     def kl_divergence(self):
-        """KL 발산 계산"""
-        weight_kl = -0.5 * torch.sum(1 + self.weight_log_var - 
-                                   (self.weight_mu - self.prior_mu).pow(2) / self.prior_std**2 - 
-                                   self.weight_log_var.exp())
-        bias_kl = -0.5 * torch.sum(1 + self.bias_log_var - 
-                                  (self.bias_mu - self.prior_mu).pow(2) / self.prior_std**2 - 
-                                  self.bias_log_var.exp())
+        """안정적인 KL 발산 계산"""
+        weight_var = torch.exp(self.weight_log_var)
+        weight_kl = 0.5 * torch.sum(
+            (self.weight_mu - self.prior_mu).pow(2) / self.prior_std**2 + 
+            weight_var / self.prior_std**2 - 
+            self.weight_log_var + torch.log(self.prior_std**2)
+        )
+        
+        bias_var = torch.exp(self.bias_log_var)
+        bias_kl = 0.5 * torch.sum(
+            (self.bias_mu - self.prior_mu).pow(2) / self.prior_std**2 + 
+            bias_var / self.prior_std**2 - 
+            self.bias_log_var + torch.log(self.prior_std**2)
+        )
+        
         return weight_kl + bias_kl
 
-# 3. 베이지안 CNN 모델
-class BayesianCNN(nn.Module):
-    """베이지안 CNN 모델 - 불확실성 모델링 포함"""
-    def __init__(self, num_classes=10, prior_std=1.0):
+# 3. 안정화된 베이지안 CNN
+class StableBayesianCNN(nn.Module):
+    """안정화된 베이지안 CNN"""
+    def __init__(self, num_classes=10, prior_std=0.1):
         super().__init__()
         self.prior_std = prior_std
         
         # 베이지안 컨볼루션 레이어들
-        self.conv1 = BayesianConv2d(3, 32, 3, padding=1, prior_std=prior_std)
-        self.conv2 = BayesianConv2d(32, 64, 3, padding=1, prior_std=prior_std)
-        self.conv3 = BayesianConv2d(64, 128, 3, padding=1, prior_std=prior_std)
+        self.conv1 = StableBayesianConv2d(3, 32, 3, padding=1, prior_std=prior_std)
+        self.conv2 = StableBayesianConv2d(32, 64, 3, padding=1, prior_std=prior_std)
+        self.conv3 = StableBayesianConv2d(64, 128, 3, padding=1, prior_std=prior_std)
         
         # 베이지안 선형 레이어들
-        self.fc1 = BayesianLinear(128 * 4 * 4, 256, prior_std=prior_std)
-        self.fc2 = BayesianLinear(256, num_classes, prior_std=prior_std)
+        self.fc1 = StableBayesianLinear(128 * 4 * 4, 256, prior_std=prior_std)
+        self.fc2 = StableBayesianLinear(256, num_classes, prior_std=prior_std)
         
-        # 배치 정규화 (베이지안이 아닌)
+        # 배치 정규화
         self.bn1 = nn.BatchNorm2d(32)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
@@ -192,7 +209,6 @@ class BayesianCNN(nn.Module):
     
     def forward(self, x, sample=True, num_samples=1):
         if num_samples > 1:
-            # Monte Carlo 샘플링으로 앙상블 예측
             outputs = []
             for _ in range(num_samples):
                 output = self._forward_single(x, sample)
@@ -222,14 +238,14 @@ class BayesianCNN(nn.Module):
         return x
     
     def kl_divergence(self):
-        """전체 모델의 KL 발산 계산"""
+        """전체 모델의 KL 발산"""
         kl = 0
         for module in [self.conv1, self.conv2, self.conv3, self.fc1, self.fc2]:
             kl += module.kl_divergence()
         return kl
     
-    def get_probabilities(self, x, temp=1.0, num_samples=5):
-        """베이지안 예측 확률 반환 (불확실성 포함)"""
+    def get_probabilities(self, x, temp=1.0, num_samples=3):
+        """베이지안 예측 확률"""
         self.eval()
         with torch.no_grad():
             x = x.to(next(self.parameters()).device)
@@ -240,23 +256,13 @@ class BayesianCNN(nn.Module):
             # 평균 예측
             mean_output = outputs.mean(dim=0)
             
-            # 불확실성 계산 (예측 분산)
+            # 불확실성 계산
             uncertainty = outputs.var(dim=0).mean(dim=1, keepdim=True)
             
             # 소프트맥스 확률
             probs = torch.softmax(mean_output / temp, dim=1)
             
             return probs, uncertainty
-    
-    def get_posterior_params(self):
-        """모든 베이지안 레이어의 사후 분포 파라미터 반환"""
-        params = {}
-        for name, module in self.named_modules():
-            if isinstance(module, (BayesianLinear, BayesianConv2d)):
-                mu, log_var = module.get_posterior_params()
-                params[f"{name}_mu"] = mu
-                params[f"{name}_log_var"] = log_var
-        return params
 
 # 4. 기존 SimpleCNN (비교용)
 class SimpleCNN(nn.Module):
@@ -299,12 +305,11 @@ class SimpleCNN(nn.Module):
             logits = self.forward(x)
             return torch.softmax(logits / temp, dim=1)
 
-# 5. 베이지안 손실 함수
-def bayesian_loss(predictions, targets, model, kl_weight=0.01):
-    """베이지안 손실 함수 (ELBO)"""
+# 5. 안정화된 베이지안 손실 함수
+def stable_bayesian_loss(predictions, targets, model, kl_weight=0.001):
+    """안정화된 베이지안 손실 함수"""
     # 예측 손실
     if predictions.dim() == 3:  # Monte Carlo 샘플링 결과
-        # 각 샘플에 대한 손실 계산 후 평균
         losses = []
         for i in range(predictions.size(0)):
             loss = F.cross_entropy(predictions[i], targets)
@@ -313,94 +318,21 @@ def bayesian_loss(predictions, targets, model, kl_weight=0.01):
     else:
         pred_loss = F.cross_entropy(predictions, targets)
     
-    # KL 발산
+    # KL 발산 (안정화)
     kl_loss = model.kl_divergence()
     
-    # ELBO (Evidence Lower BOund)
-    total_loss = pred_loss + kl_weight * kl_loss
+    # 동적 KL 가중치 (학습 초기에는 작게)
+    if hasattr(model, 'training_step'):
+        dynamic_kl_weight = kl_weight * min(1.0, model.training_step / 1000)
+    else:
+        dynamic_kl_weight = kl_weight
+    
+    # ELBO
+    total_loss = pred_loss + dynamic_kl_weight * kl_loss
     
     return total_loss, pred_loss, kl_loss
 
-# 6. 베이지안 집계 함수
-def bayesian_aggregate(global_model, client_models, client_losses, client_samples):
-    """베이지안 모델 집계 - 불확실성 전파 고려"""
-    if not use_bayesian:
-        # 기존 방식으로 집계
-        return server_aggregate_fast(global_model, 
-                                   [model.state_dict() for model in client_models], 
-                                   client_losses, client_samples)
-    
-    # 베이지안 집계
-    global_dict = global_model.state_dict()
-    
-    # 가중치 계산
-    if use_importance_sampling and len(client_losses) > 0:
-        valid_losses = [max(loss, 1e-6) for loss in client_losses if math.isfinite(loss)]
-        if valid_losses:
-            weights = np.array([loss ** q for loss in valid_losses])
-            weights = weights / weights.sum()
-        else:
-            weights = np.ones(len(client_models)) / len(client_models)
-    else:
-        total_samples = sum(client_samples)
-        if total_samples > 0:
-            weights = np.array(client_samples) / total_samples
-        else:
-            weights = np.ones(len(client_models)) / len(client_models)
-    
-    # 베이지안 파라미터 집계
-    for key in global_dict.keys():
-        if 'mu' in key or 'log_var' in key:
-            # 베이지안 파라미터는 가중 평균으로 집계
-            weighted_sum = torch.zeros_like(global_dict[key], dtype=torch.float32)
-            for i, client_model in enumerate(client_models):
-                client_dict = client_model.state_dict()
-                weighted_sum += weights[i] * client_dict[key].float()
-            global_dict[key] = weighted_sum.to(global_dict[key].dtype)
-        else:
-            # 일반 파라미터는 기존 방식
-            if len(client_models) > 0:
-                weighted_sum = torch.zeros_like(global_dict[key], dtype=torch.float32)
-                for i, client_model in enumerate(client_models):
-                    client_dict = client_model.state_dict()
-                    if key in client_dict:
-                        weighted_sum += weights[i] * client_dict[key].float()
-                global_dict[key] = weighted_sum.to(global_dict[key].dtype)
-    
-    global_model.load_state_dict(global_dict)
-    return global_model, weights
-
-# 7. 베이지안 평가 함수
-def evaluate_bayesian_model(model, testloader, num_samples=5):
-    """베이지안 모델 평가 - 불확실성 포함"""
-    model.eval()
-    correct = 0
-    total = 0
-    uncertainties = []
-    
-    with torch.no_grad():
-        for x, y in testloader:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            
-            if use_bayesian:
-                # 베이지안 예측
-                probs, uncertainty = model.get_probabilities(x, num_samples=num_samples)
-                _, predicted = torch.max(probs, 1)
-                uncertainties.extend(uncertainty.cpu().numpy().flatten())
-            else:
-                # 일반 예측
-                outputs = model(x)
-                _, predicted = torch.max(outputs, 1)
-            
-            total += y.size(0)
-            correct += (predicted == y).sum().item()
-    
-    accuracy = 100 * correct / total if total > 0 else 0
-    avg_uncertainty = np.mean(uncertainties) if uncertainties else 0
-    
-    return accuracy, avg_uncertainty
-
-# 8. 최적화된 데이터셋 준비
+# 6. 최적화된 데이터셋 준비
 def prepare_dataset():
     """CIFAR-10 데이터셋 준비 및 Non-IID 분할"""
     # 간소화된 변환
@@ -461,7 +393,7 @@ def partition_dataset_fast(dataset, num_clients, alpha):
 
     return client_indices
 
-# 9. 최적화된 클라이언트 업데이트 (지식 증류 포함)
+# 7. 최적화된 클라이언트 업데이트 (지식 증류 포함)
 def client_update_fast(client_model, data_loader, criterion, global_model, round_idx):
     """최적화된 클라이언트 학습 (지식 증류 포함) - 베이지안 모드 지원"""
     if len(data_loader.dataset) == 0:
@@ -492,7 +424,7 @@ def client_update_fast(client_model, data_loader, criterion, global_model, round
                 # 베이지안 예측 (Monte Carlo 샘플링)
                 output = client_model(x, sample=True, num_samples=num_samples)
                 # 베이지안 손실 계산
-                loss, pred_loss, kl_loss = bayesian_loss(output, y, client_model, kl_weight)
+                loss, pred_loss, kl_loss = stable_bayesian_loss(output, y, client_model, kl_weight)
             else:
                 # 일반 예측
                 output = client_model(x)
@@ -563,7 +495,7 @@ def apply_pruning(model, threshold):
                 mask = param.abs() > (param.abs().mean() * threshold)
                 param.mul_(mask)
 
-# 10. 최적화된 서버 집계
+# 8. 최적화된 서버 집계
 def server_aggregate_fast(global_model, client_states, client_losses, client_samples):
     """빠른 서버 집계"""
     global_dict = global_model.state_dict()
@@ -596,7 +528,7 @@ def server_aggregate_fast(global_model, client_states, client_losses, client_sam
     global_model.load_state_dict(global_dict)
     return global_model, weights
 
-# 11. 모델 평가
+# 9. 모델 평가
 def evaluate_model_fast(model, testloader):
     """빠른 모델 평가"""
     model.eval()
@@ -644,7 +576,7 @@ def calculate_communication_cost(model, num_participating_clients, use_compressi
     total_cost = download_cost + upload_cost
     return total_cost, download_cost, upload_cost
 
-# 12. 메인 연합 학습 함수 (최적화됨 + 통신비용 분석)
+# 10. 메인 연합 학습 함수 (최적화됨 + 통신비용 분석)
 def federated_learning_fast():
     """최적화된 연합 학습 (통신비용 분석 포함) - 베이지안 모드 지원"""
     print("데이터셋 준비 중...")
@@ -652,13 +584,13 @@ def federated_learning_fast():
 
     print("모델 초기화 중...")
     if use_bayesian:
-        global_model = BayesianCNN(prior_std=prior_std).to(device)
-        print("베이지안 CNN 모델 사용")
+        global_model = StableBayesianCNN(prior_std=prior_std).to(device)
+        print("안정화된 베이지안 CNN 모델 사용")
+        criterion = stable_bayesian_loss
     else:
         global_model = SimpleCNN().to(device)
         print("일반 CNN 모델 사용")
-    
-    criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss()
 
     # 모델 크기 정보 출력
     num_params, model_size_bytes = calculate_model_size(global_model)
@@ -714,7 +646,7 @@ def federated_learning_fast():
         for client_id in participating_clients:
             # 클라이언트 모델 복사
             if use_bayesian:
-                client_model = BayesianCNN(prior_std=prior_std).to(device)
+                client_model = StableBayesianCNN(prior_std=prior_std).to(device)
             else:
                 client_model = SimpleCNN().to(device)
             client_model.load_state_dict(global_model.state_dict())
@@ -828,6 +760,84 @@ def federated_learning_fast():
 
     return global_model, accuracies, losses_per_round, communication_costs
 
+def analyze_performance_improvements(performance_improvements, accuracies):
+    """성능 향상 요인 분석 - 베이지안 모드 포함"""
+    print(f"\n=== 성능 향상 요인 분석 ===")
+
+    # 각 기법이 적용되기 시작한 시점의 정확도 변화 분석
+    kd_start_round = None
+    pruning_start_round = None
+    bayesian_start_round = None
+
+    for round_idx, info in performance_improvements.items():
+        if info['knowledge_distillation'] and kd_start_round is None:
+            kd_start_round = round_idx
+        if info['adaptive_pruning'] and pruning_start_round is None:
+            pruning_start_round = round_idx
+        if info['bayesian'] and bayesian_start_round is None:
+            bayesian_start_round = round_idx
+
+    # 기법별 성능 향상 분석
+    improvements = []
+
+    # 1. 지식 증류 효과
+    if kd_start_round is not None and kd_start_round > 0:
+        acc_before_kd = accuracies[kd_start_round - 1]
+        acc_after_kd = np.mean(accuracies[kd_start_round:kd_start_round + 3]) if len(accuracies) > kd_start_round + 2 else accuracies[-1]
+        kd_improvement = acc_after_kd - acc_before_kd
+        improvements.append(f"지식 증류: +{kd_improvement:.2f}%p (라운드 {kd_start_round + 1}부터)")
+
+    # 2. 가지치기 효과
+    if pruning_start_round is not None:
+        acc_before_pruning = accuracies[pruning_start_round - 1] if pruning_start_round > 0 else accuracies[0]
+        acc_after_pruning = np.mean(accuracies[pruning_start_round:]) if len(accuracies) > pruning_start_round else accuracies[-1]
+        pruning_improvement = acc_after_pruning - acc_before_pruning
+        improvements.append(f"적응적 가지치기: +{pruning_improvement:.2f}%p (라운드 {pruning_start_round + 1}부터)")
+
+    # 3. 베이지안 추론 효과
+    if bayesian_start_round is not None:
+        improvements.append("베이지안 추론: 불확실성 정량화 및 앙상블 효과")
+        improvements.append(f"  - Monte Carlo 샘플링: {num_samples}개 샘플")
+        improvements.append(f"  - KL 발산 가중치: {kl_weight}")
+        improvements.append(f"  - 사전 분포 표준편차: {prior_std}")
+
+    # 4. 중요도 샘플링 효과
+    if use_importance_sampling:
+        improvements.append("중요도 샘플링: 가중치 기반 집계로 수렴 안정성 향상")
+
+    # 5. 서버 모멘텀 효과
+    if use_server_momentum:
+        improvements.append("서버 모멘텀: 글로벌 모델 업데이트 안정성 향상")
+
+    # 6. 최적화된 학습 설정
+    improvements.append(f"배치 크기 증가 (64→128): 학습 안정성 향상")
+    improvements.append(f"그래디언트 클리핑: 학습 안정성 향상")
+    improvements.append(f"가중치 감쇠: 과적합 방지")
+
+    # 7. 베이지안 특화 설정
+    if use_bayesian:
+        improvements.append("베이지안 특화 설정:")
+        improvements.append(f"  - Adam 옵티마이저: 베이지안 학습에 최적화")
+        improvements.append(f"  - 변분 추론: 효율적인 사후 분포 근사")
+        improvements.append(f"  - 재매개화 트릭: 그래디언트 추정 개선")
+
+    print("주요 성능 향상 요인:")
+    for i, improvement in enumerate(improvements, 1):
+        print(f"  {i}. {improvement}")
+
+    # 전체 성능 향상 요약
+    total_improvement = accuracies[-1] - accuracies[0]
+    print(f"\n총 성능 향상: {total_improvement:.2f}%p ({accuracies[0]:.2f}% → {accuracies[-1]:.2f}%)")
+
+    # 베이지안 모드 특별 분석
+    if use_bayesian:
+        print(f"\n=== 베이지안 모드 특별 분석 ===")
+        print(f"베이지안 추론의 장점:")
+        print(f"  1. 불확실성 정량화: 예측 신뢰도 측정 가능")
+        print(f"  2. 앙상블 효과: Monte Carlo 샘플링으로 성능 향상")
+        print(f"  3. 정규화 효과: KL 발산으로 과적합 방지")
+        print(f"  4. 강건성: Non-IID 데이터에 대한 견고성 향상")
+
 def plot_results_with_uncertainty(accuracies, losses, comm_costs, comm_costs_compressed, uncertainties):
     """불확실성 포함 결과 시각화"""
     plt.figure(figsize=(18, 12))
@@ -922,84 +932,6 @@ def plot_results_with_uncertainty(accuracies, losses, comm_costs, comm_costs_com
     plt.savefig('bayesian_federated_learning_results.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-def analyze_performance_improvements(performance_improvements, accuracies):
-    """성능 향상 요인 분석 - 베이지안 모드 포함"""
-    print(f"\n=== 성능 향상 요인 분석 ===")
-
-    # 각 기법이 적용되기 시작한 시점의 정확도 변화 분석
-    kd_start_round = None
-    pruning_start_round = None
-    bayesian_start_round = None
-
-    for round_idx, info in performance_improvements.items():
-        if info['knowledge_distillation'] and kd_start_round is None:
-            kd_start_round = round_idx
-        if info['adaptive_pruning'] and pruning_start_round is None:
-            pruning_start_round = round_idx
-        if info['bayesian'] and bayesian_start_round is None:
-            bayesian_start_round = round_idx
-
-    # 기법별 성능 향상 분석
-    improvements = []
-
-    # 1. 지식 증류 효과
-    if kd_start_round is not None and kd_start_round > 0:
-        acc_before_kd = accuracies[kd_start_round - 1]
-        acc_after_kd = np.mean(accuracies[kd_start_round:kd_start_round + 3]) if len(accuracies) > kd_start_round + 2 else accuracies[-1]
-        kd_improvement = acc_after_kd - acc_before_kd
-        improvements.append(f"지식 증류: +{kd_improvement:.2f}%p (라운드 {kd_start_round + 1}부터)")
-
-    # 2. 가지치기 효과
-    if pruning_start_round is not None:
-        acc_before_pruning = accuracies[pruning_start_round - 1] if pruning_start_round > 0 else accuracies[0]
-        acc_after_pruning = np.mean(accuracies[pruning_start_round:]) if len(accuracies) > pruning_start_round else accuracies[-1]
-        pruning_improvement = acc_after_pruning - acc_before_pruning
-        improvements.append(f"적응적 가지치기: +{pruning_improvement:.2f}%p (라운드 {pruning_start_round + 1}부터)")
-
-    # 3. 베이지안 추론 효과
-    if bayesian_start_round is not None:
-        improvements.append("베이지안 추론: 불확실성 정량화 및 앙상블 효과")
-        improvements.append(f"  - Monte Carlo 샘플링: {num_samples}개 샘플")
-        improvements.append(f"  - KL 발산 가중치: {kl_weight}")
-        improvements.append(f"  - 사전 분포 표준편차: {prior_std}")
-
-    # 4. 중요도 샘플링 효과
-    if use_importance_sampling:
-        improvements.append("중요도 샘플링: 가중치 기반 집계로 수렴 안정성 향상")
-
-    # 5. 서버 모멘텀 효과
-    if use_server_momentum:
-        improvements.append("서버 모멘텀: 글로벌 모델 업데이트 안정성 향상")
-
-    # 6. 최적화된 학습 설정
-    improvements.append(f"배치 크기 증가 (64→128): 학습 안정성 향상")
-    improvements.append(f"그래디언트 클리핑: 학습 안정성 향상")
-    improvements.append(f"가중치 감쇠: 과적합 방지")
-
-    # 7. 베이지안 특화 설정
-    if use_bayesian:
-        improvements.append("베이지안 특화 설정:")
-        improvements.append(f"  - Adam 옵티마이저: 베이지안 학습에 최적화")
-        improvements.append(f"  - 변분 추론: 효율적인 사후 분포 근사")
-        improvements.append(f"  - 재매개화 트릭: 그래디언트 추정 개선")
-
-    print("주요 성능 향상 요인:")
-    for i, improvement in enumerate(improvements, 1):
-        print(f"  {i}. {improvement}")
-
-    # 전체 성능 향상 요약
-    total_improvement = accuracies[-1] - accuracies[0]
-    print(f"\n총 성능 향상: {total_improvement:.2f}%p ({accuracies[0]:.2f}% → {accuracies[-1]:.2f}%)")
-
-    # 베이지안 모드 특별 분석
-    if use_bayesian:
-        print(f"\n=== 베이지안 모드 특별 분석 ===")
-        print(f"베이지안 추론의 장점:")
-        print(f"  1. 불확실성 정량화: 예측 신뢰도 측정 가능")
-        print(f"  2. 앙상블 효과: Monte Carlo 샘플링으로 성능 향상")
-        print(f"  3. 정규화 효과: KL 발산으로 과적합 방지")
-        print(f"  4. 강건성: Non-IID 데이터에 대한 견고성 향상")
-
 def plot_results_with_communication(accuracies, losses, comm_costs, comm_costs_compressed):
     """통신비용 포함 결과 시각화"""
     plt.figure(figsize=(16, 10))
@@ -1090,17 +1022,17 @@ def plot_results(accuracies, losses):
     plt.savefig('federated_learning_results.png', dpi=150, bbox_inches='tight')
     plt.show()
 
-# 13. 간소화된 하이퍼파라미터 최적화
+# 11. 간소화된 하이퍼파라미터 최적화
 def quick_hyperparameter_search():
     """빠른 하이퍼파라미터 검색 - 베이지안 모드 포함"""
     print("빠른 하이퍼파라미터 검색 시작...")
 
     # 제한된 파라미터 그리드 (베이지안 파라미터 포함)
     param_combinations = [
-        {'q': 1.0, 'pruning_thr': 0.1, 'use_importance_sampling': True, 'kd_alpha': 0.3, 'kl_weight': 0.01},
-        {'q': 1.2, 'pruning_thr': 0.15, 'use_importance_sampling': True, 'kd_alpha': 0.5, 'kl_weight': 0.01},
-        {'q': 1.5, 'pruning_thr': 0.2, 'use_importance_sampling': False, 'kd_alpha': 0.7, 'kl_weight': 0.005},
-        {'q': 1.2, 'pruning_thr': 0.15, 'use_importance_sampling': True, 'kd_alpha': 0.5, 'kl_weight': 0.02},
+        {'q': 1.0, 'pruning_thr': 0.1, 'use_importance_sampling': True, 'kd_alpha': 0.3, 'kl_weight': 0.001},
+        {'q': 1.2, 'pruning_thr': 0.15, 'use_importance_sampling': True, 'kd_alpha': 0.5, 'kl_weight': 0.001},
+        {'q': 1.5, 'pruning_thr': 0.2, 'use_importance_sampling': False, 'kd_alpha': 0.7, 'kl_weight': 0.0005},
+        {'q': 1.2, 'pruning_thr': 0.15, 'use_importance_sampling': True, 'kd_alpha': 0.5, 'kl_weight': 0.002},
     ]
 
     best_accuracy = 0
@@ -1146,9 +1078,88 @@ def quick_hyperparameter_search():
 
     return best_params
 
+# 베이지안 집계 함수
+def bayesian_aggregate(global_model, client_models, client_losses, client_samples):
+    """베이지안 모델 집계 - 불확실성 전파 고려"""
+    if not use_bayesian:
+        # 기존 방식으로 집계
+        return server_aggregate_fast(global_model, 
+                                   [model.state_dict() for model in client_models], 
+                                   client_losses, client_samples)
+    
+    # 베이지안 집계
+    global_dict = global_model.state_dict()
+    
+    # 가중치 계산
+    if use_importance_sampling and len(client_losses) > 0:
+        valid_losses = [max(loss, 1e-6) for loss in client_losses if math.isfinite(loss)]
+        if valid_losses:
+            weights = np.array([loss ** q for loss in valid_losses])
+            weights = weights / weights.sum()
+        else:
+            weights = np.ones(len(client_models)) / len(client_models)
+    else:
+        total_samples = sum(client_samples)
+        if total_samples > 0:
+            weights = np.array(client_samples) / total_samples
+        else:
+            weights = np.ones(len(client_models)) / len(client_models)
+    
+    # 베이지안 파라미터 집계
+    for key in global_dict.keys():
+        if 'mu' in key or 'log_var' in key:
+            # 베이지안 파라미터는 가중 평균으로 집계
+            weighted_sum = torch.zeros_like(global_dict[key], dtype=torch.float32)
+            for i, client_model in enumerate(client_models):
+                client_dict = client_model.state_dict()
+                weighted_sum += weights[i] * client_dict[key].float()
+            global_dict[key] = weighted_sum.to(global_dict[key].dtype)
+        else:
+            # 일반 파라미터는 기존 방식
+            if len(client_models) > 0:
+                weighted_sum = torch.zeros_like(global_dict[key], dtype=torch.float32)
+                for i, client_model in enumerate(client_models):
+                    client_dict = client_model.state_dict()
+                    if key in client_dict:
+                        weighted_sum += weights[i] * client_dict[key].float()
+                global_dict[key] = weighted_sum.to(global_dict[key].dtype)
+    
+    global_model.load_state_dict(global_dict)
+    return global_model, weights
+
+# 베이지안 평가 함수
+def evaluate_bayesian_model(model, testloader, num_samples=3):
+    """베이지안 모델 평가 - 불확실성 포함"""
+    model.eval()
+    correct = 0
+    total = 0
+    uncertainties = []
+    
+    with torch.no_grad():
+        for x, y in testloader:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            
+            if use_bayesian:
+                # 베이지안 예측
+                probs, uncertainty = model.get_probabilities(x, num_samples=num_samples)
+                _, predicted = torch.max(probs, 1)
+                uncertainties.extend(uncertainty.cpu().numpy().flatten())
+            else:
+                # 일반 예측
+                outputs = model(x)
+                _, predicted = torch.max(outputs, 1)
+            
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
+    
+    accuracy = 100 * correct / total if total > 0 else 0
+    avg_uncertainty = np.mean(uncertainties) if uncertainties else 0
+    
+    return accuracy, avg_uncertainty
+
 # 메인 실행
 if __name__ == "__main__":
-    print("=== 베이지안 FedHB 연합 학습 ===")
+    print("=== 안정화된 베이지안 FedHB 연합 학습 ===")
     
     if use_bayesian:
         print("베이지안 모드 활성화")
@@ -1173,8 +1184,8 @@ if __name__ == "__main__":
 
     # 모델 저장
     if use_bayesian:
-        torch.save(global_model.state_dict(), 'bayesian_federated_model.pth')
-        print("베이지안 모델 저장 완료!")
+        torch.save(global_model.state_dict(), 'stable_bayesian_federated_model.pth')
+        print("안정화된 베이지안 모델 저장 완료!")
     else:
         torch.save(global_model.state_dict(), 'optimized_federated_model.pth')
         print("일반 모델 저장 완료!")
